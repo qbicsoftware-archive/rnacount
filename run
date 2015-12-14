@@ -1,0 +1,34 @@
+#!/usr/bin/env python
+import json
+import sys
+import subprocess
+import os
+
+if len(sys.argv) == 2:
+    path = sys.argv[1]
+else:
+    path = 'config.json'
+
+with open(path) as config_file:
+    params = json.load(config_file)
+
+
+command = [
+    os.path.join(params['src'], 'rnacount.py'),
+    '--barcodes', os.path.join(params['etc'], 'barcodes.tsv'),
+    '--library', os.path.join(params['etc'], 'library.tsv'),
+    '--barcode-range', '21:24',
+    '--lib-range', '20:39',
+    '--seq-range', '2:21',
+    '--write-split', os.path.join(params['result'], 'by_barcode'),
+    '--stats', os.path.join(params['result'], 'stats.json'),
+    '--input',  os.listdir(params['data']),
+    '--output', os.path.join(params['result'], 'counts.xlsx'),
+]
+
+subprocess.check_call(
+    command,
+    cwd=params['base'],
+    stdout=os.path.join(params['log'], 'main.out'),
+    stderr=os.path.join(params['log'], 'main.err'),
+)
