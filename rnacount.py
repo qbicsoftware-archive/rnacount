@@ -1,9 +1,4 @@
 #!/usr/bin/env python
-"""
-Count multiplexed shRNA reads.
-
-
-"""
 import argparse
 import collections
 import logging
@@ -13,6 +8,7 @@ import json
 import skbio
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 
 def parse_slice(str_slice):
@@ -68,11 +64,16 @@ def find_multiple(seq):
 def read_library(path, library_slice):
     library = pd.read_csv(path, sep='\t', names=["seq"])
     library = library['seq']
-    library_trim = library.str[library_slice]
+
+    if not library.index.is_unique:
+        raise ValueError("Index of library sequences is not unique.")
     for seq in find_multiple(library.values):
         logging.warn("Library sequence is not unique: %s" % seq)
-    for seq in find_multiple(library_trim.values):
-        logging.warn("Trimmed library sequence is not unique: %s" % seq)
+    library = library.drop_duplicates()
+
+    library_trim = library.str[library_slice]
+    if find_multiple(library_trim.values):
+        raise ValueError("Library is not unique after trimming.")
 
     return library, library_trim
 
@@ -83,6 +84,8 @@ def read_barcodes(path):
     barcodes = barcodes.str.upper()
     if len(barcodes.unique()) != len(barcodes):
         raise ValueError("Barcodes are not unique.")
+    if not barcodes.index.is_unique:
+        raise ValueError("Barcode index is not unique.")
 
     return barcodes
 
@@ -123,12 +126,14 @@ def count_reads(reads, library, barcodes, barcode_range, seq_range,
     count_data = np.zeros((len(library), len(barcodes)), dtype=int)
     counts = pd.DataFrame(count_data,
                           index=library.index,
-                          columns=barcodes.values)
+                          columns=barcodes.index)
 
     count_no_barcode = 0
     count_no_source = 0
+    num_reads = 0
 
     for read in reads:
+        num_reads += 1
         barcode_idx = barcodes.get(str(read[barcode_range]), None)
         source_idx = library.get(str(read[seq_range]), None)
 
@@ -151,6 +156,7 @@ def count_reads(reads, library, barcodes, barcode_range, seq_range,
             split_writer.write(read, barcode=barcode, source=source)
 
     stats = {
+        'num_reads': num_reads,
         'count_no_barcode': count_no_barcode,
         'count_not_in_lib': count_no_source,
     }
@@ -181,6 +187,7 @@ def main():
 
     counts.to_excel(args.output)
     if args.stats:
+        stats['date'] = datetime.now().isoformat()
         with open(args.stats, 'w') as fileobj:
             json.dump(stats, fileobj, indent=4)
 
