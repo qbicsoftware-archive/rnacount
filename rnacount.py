@@ -8,10 +8,11 @@ import argparse
 import collections
 import logging
 import os
+import itertools
+import json
 import skbio
 import numpy as np
 import pandas as pd
-import stats
 
 
 def parse_slice(str_slice):
@@ -52,7 +53,7 @@ def gen_argparse():
                         "directory according to the barcode they contain")
     parser.add_argument("--stats", default=None, type=str,
                         help="Write statistics to json file.")
-    parser.add_argument("input", nargs='+'
+    parser.add_argument("input", nargs='+',
                         help="Fastq file(s) containing the reads.")
     parser.add_argument("output", help="Name of the output excel file.")
     return parser
@@ -162,7 +163,9 @@ def main():
 
     library, library_trim = read_library(args.library, args.lib_range)
     barcodes = read_barcodes(args.barcodes)
-    reads = skbio.io.read(args.input, format='fastq', variant='sanger')
+    reads = [skbio.io.read(input, format='fastq', variant='sanger')
+             for input in args.input]
+    reads = itertools.chain(*reads)
 
     if args.write_split:
         template = "reads_{barcode}_{source}.fastq"
