@@ -5,10 +5,11 @@ import logging
 import os
 import itertools
 import json
-import skbio
+import fileinput
 import numpy as np
 import pandas as pd
 from datetime import datetime
+import cytoolz as toolz
 
 
 def parse_slice(str_slice):
@@ -63,7 +64,7 @@ def find_multiple(seq):
 
 def read_library(path, library_slice):
     library = pd.read_csv(path, sep='\t', names=["seq"])
-    library = library['seq']
+    library = library['seq'].str.upper()
 
     if not library.index.is_unique:
         raise ValueError("Index of library sequences is not unique.")
@@ -75,13 +76,14 @@ def read_library(path, library_slice):
     if find_multiple(library_trim.values):
         raise ValueError("Library is not unique after trimming.")
 
-    return library, library_trim
+    return library.astype(bytes), library_trim.astype(bytes)
 
 
 def read_barcodes(path):
     barcodes = pd.read_csv(path, sep='\t', names=["barcode"])
     barcodes = barcodes['barcode']
     barcodes = barcodes.str.upper()
+    barcodes = barcodes.astype(bytes)
     if len(barcodes.unique()) != len(barcodes):
         raise ValueError("Barcodes are not unique.")
     if not barcodes.index.is_unique:
@@ -96,18 +98,22 @@ class SplitWriter:
         self._template = name_template
         self._basedir = basedir
         self._files = {}
-        os.mkdir(basedir)
+        try:
+            os.mkdir(basedir)
+        except FileExistsError:
+            pass
 
     def write(self, read, *args, **kwargs):
         fileobj = self._get_file(*args, **kwargs)
-        read.write(fileobj, format='fastq', variant="sanger")
+        for line in read:
+            fileobj.write(line)
 
     def _get_file(self, *args, **kwargs):
         name = self._template.format(*args, **kwargs)
         if name in self._files:
             return self._files[name]
         path = os.path.join(self._basedir, name)
-        self._files[name] = open(path, 'x')
+        self._files[name] = open(path, 'xb')
         return self._files[name]
 
     def __enter__(self):
@@ -128,37 +134,50 @@ def count_reads(reads, library, barcodes, barcode_range, seq_range,
                           index=library.index,
                           columns=barcodes.index)
 
+    count_vals = counts.values
+    barcode_vals = barcodes.values
+    library_vals = library.values
+
     count_no_barcode = 0
     count_no_source = 0
+    count_contains_N = 0
     num_reads = 0
 
     for read in reads:
         num_reads += 1
-        barcode_idx = barcodes.get(str(read[barcode_range]), None)
-        source_idx = library.get(str(read[seq_range]), None)
+        read_str = read[1].strip().upper()
+
+        if b'N' in read_str:
+            count_contains_N += 1
+            continue
+
+        barcode_idx = barcode_lookup.get(read_str[barcode_range], None)
+        source_idx = library_lookup.get(read_str[seq_range], None)
 
         if source_idx is not None and barcode_idx is not None:
-            counts.iat[source_idx, barcode_idx] += 1
+            count_vals[source_idx, barcode_idx] += 1
 
         if barcode_idx is None:
             count_no_barcode += 1
             barcode = "no_valid_barcode"
         else:
-            barcode = barcodes.iloc[barcode_idx]
+            barcode = barcode_vals[barcode_idx]
 
         if source_idx is None:
             count_no_source += 1
             source = "unknown"
         else:
-            source = ""
+            source = "in_library"
 
         if split_writer is not None:
-            split_writer.write(read, barcode=barcode, source=source)
+            split_writer.write(read, barcode=barcode.decode(),
+                               source=source.decode())
 
     stats = {
         'num_reads': num_reads,
         'count_no_barcode': count_no_barcode,
         'count_not_in_lib': count_no_source,
+        'count_contains_N': count_contains_N,
     }
 
     return counts, stats
@@ -169,23 +188,52 @@ def main():
 
     library, library_trim = read_library(args.library, args.lib_range)
     barcodes = read_barcodes(args.barcodes)
-    reads = [skbio.io.read(input, format='fastq', variant='sanger')
-             for input in args.input]
-    reads = itertools.chain(*reads)
+
+    def lines(name):
+        if name == '-':
+            yield from sys.stdin.buffer
+        if name.endswith('.gz'):
+            with gzip.open(name, 'rb') as file:
+                yield from file
+        with open(name, 'rb') as file:
+            yield from file
+
+    reads = itertools.chain.from_iterable(lines(name) for name in args.input)
+    reads = toolz.partition(4, reads)
 
     if args.write_split:
         template = "reads_{barcode}_{source}.fastq"
         with SplitWriter(args.write_split, template) as writer:
             counts, stats = count_reads(
-                reads, library, barcodes, args.barcode_range,
+                reads, library_trim, barcodes, args.barcode_range,
                 args.seq_range, writer
             )
     else:
         counts, stats = count_reads(
-            reads, library, barcodes, args.barcode_range, args.seq_range
+            reads, library_trim, barcodes, args.barcode_range,
+            args.seq_range
         )
 
     counts.to_excel(args.output)
+
+    counts.index.name = "gene"
+    counts.columns.name = "barcode"
+
+    counts = counts.unstack()
+    counts.name = "count"
+
+    groups = counts.reset_index().groupby("barcode")
+    by_barcode = dict(
+        (
+            key,
+            val.sort_values(by=["count", "gene"], ascending=False)
+                .reset_index()[["gene", "count"]]
+        )
+        for key, val in groups
+    )
+    counts_sorted = pd.concat(by_barcode, axis=1)
+    counts_sorted.to_excel("counts_sorted.xlsx")
+
     if args.stats:
         stats['date'] = datetime.now().isoformat()
         with open(args.stats, 'w') as fileobj:
