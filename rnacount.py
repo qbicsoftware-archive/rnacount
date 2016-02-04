@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 import cytoolz as toolz
+import numba
 
 
 def parse_slice(str_slice):
@@ -135,8 +136,7 @@ def count_reads(reads, library, barcodes, barcode_range, seq_range,
                           columns=barcodes.index)
 
     count_vals = counts.values
-    barcode_vals = barcodes.values
-    library_vals = library.values
+    barcode_vals = list(barcodes.values)
 
     count_no_barcode = 0
     count_no_source = 0
@@ -151,27 +151,30 @@ def count_reads(reads, library, barcodes, barcode_range, seq_range,
             count_contains_N += 1
             continue
 
-        barcode_idx = barcode_lookup.get(read_str[barcode_range], None)
-        source_idx = library_lookup.get(read_str[seq_range], None)
-
-        if source_idx is not None and barcode_idx is not None:
-            count_vals[source_idx, barcode_idx] += 1
-
-        if barcode_idx is None:
+        barcode_idx = barcode_lookup.get(read_str[barcode_range])
+        if barcode_idx is not None:
+            barcode = barcode_vals[barcode_idx]
+            has_barcode = True
+        else:
             count_no_barcode += 1
             barcode = "no_valid_barcode"
-        else:
-            barcode = barcode_vals[barcode_idx]
 
-        if source_idx is None:
+            has_barcode = False
+        source_idx = library_lookup.get(read_str[seq_range])
+        if source_idx is not None:
+            source = "in_library"
+            has_source = True
+        else:
             count_no_source += 1
             source = "unknown"
-        else:
-            source = "in_library"
+            has_source = False
+
+        if has_source and has_barcode:
+            count_vals[source_idx, barcode_idx] += 1
 
         if split_writer is not None:
-            split_writer.write(read, barcode=barcode.decode(),
-                               source=source.decode())
+            split_writer.write(read, barcode=barcode,
+                               source=source)
 
     stats = {
         'num_reads': num_reads,
@@ -200,6 +203,7 @@ def main():
 
     reads = itertools.chain.from_iterable(lines(name) for name in args.input)
     reads = toolz.partition(4, reads)
+    """reads = itertools.islice(reads, 10000000)"""
 
     if args.write_split:
         template = "reads_{barcode}_{source}.fastq"
@@ -227,7 +231,7 @@ def main():
         (
             key,
             val.sort_values(by=["count", "gene"], ascending=False)
-                .reset_index()[["gene", "count"]]
+                    .reset_index()[["gene", "count"]]
         )
         for key, val in groups
     )
