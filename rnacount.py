@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 import cytoolz as toolz
-import numba
+import gzip
 
 
 def parse_slice(str_slice):
@@ -64,7 +64,7 @@ def find_multiple(seq):
 
 
 def read_library(path, library_slice):
-    library = pd.read_csv(path, sep='\t', names=["seq"])
+    library = pd.read_csv(path, sep='\t', names=["seq"], header=None)
     library = library['seq'].str.upper()
 
     if not library.index.is_unique:
@@ -74,8 +74,8 @@ def read_library(path, library_slice):
     library = library.drop_duplicates()
 
     library_trim = library.str[library_slice]
-    if find_multiple(library_trim.values):
-        raise ValueError("Library is not unique after trimming.")
+    #if find_multiple(library_trim.values):
+    #    raise ValueError("Library is not unique after trimming.")
 
     return library.astype(bytes), library_trim.astype(bytes)
 
@@ -125,8 +125,31 @@ class SplitWriter:
             fileobj.close()
 
 
-def count_reads(reads, library, barcodes, barcode_range, seq_range,
-                split_writer=None):
+def count_reads(reads, library, barcodes, loop_rc, adapters,
+                oligo_offset, barcode_offset, adapter_offsets,
+                expect_loop_idx, loop_idx_precision=2, split_writer=None,
+                barcode_len=3, oligo_len=19):
+    """ Count the number of reads that contain oligo sequences.
+
+    Parameters
+    ----------
+    reads:
+        Iterator of 4-tuples (the 4 lines of the fastq)
+    library: pd.
+        The oligo sequences.
+    barcodes: pd.Series
+        Barcodes for demultiplexing.
+    loop_rc: upper case str
+        The loop sequence should be in every read. All positions in the
+        read are seen relative to this loop sequence.
+    adapters: list of upper case str
+        A list of possible adapters.
+    *_offset: int
+        Offsets for the sequences relative to the loop location.
+    """
+
+    assert len(adapters) == len(adapter_offsets)
+
     library_lookup = dict((v, i) for i, v in enumerate(library.values))
     barcode_lookup = dict((v, i) for i, v in enumerate(barcodes.values))
 
@@ -138,52 +161,90 @@ def count_reads(reads, library, barcodes, barcode_range, seq_range,
     count_vals = counts.values
     barcode_vals = list(barcodes.values)
 
-    count_no_barcode = 0
-    count_no_source = 0
-    count_contains_N = 0
     num_reads = 0
+    adapter_counts = [0 for i in adapters]
+    pos_dist = collections.Counter()
+    oligo_counts = collections.Counter()
+    no_loop = 0
+    no_adapter = 0
+    no_barcode = 0
+    no_oligo = 0
+    bad_loop_idx = 0
 
     for read in reads:
         num_reads += 1
         read_str = read[1].strip().upper()
+        loop_idx = read_str.find(loop_rc)
 
-        if b'N' in read_str:
-            count_contains_N += 1
+        if loop_idx == -1:
+            no_loop += 1
             continue
 
-        barcode_idx = barcode_lookup.get(read_str[barcode_range])
-        if barcode_idx is not None:
-            barcode = barcode_vals[barcode_idx]
-            has_barcode = True
+        pos_dist[loop_idx] += 1
+        if abs(loop_idx - expect_loop_idx) > loop_idx_precision:
+            bad_loop_idx += 1
+            continue
+
+        for i, (adapter, offset) in enumerate(zip(adapters, adapter_offsets)):
+            if read_str[loop_idx + offset:].startswith(adapter):
+                adapter_counts[i] += 1
+                break
         else:
-            count_no_barcode += 1
-            barcode = "no_valid_barcode"
+            no_adapter += 1
+            continue
 
-            has_barcode = False
-        source_idx = library_lookup.get(read_str[seq_range])
-        if source_idx is not None:
-            source = "in_library"
-            has_source = True
-        else:
-            count_no_source += 1
-            source = "unknown"
-            has_source = False
+        barcode_idx = loop_idx + barcode_offset
+        barcode = read_str[barcode_idx:barcode_idx+barcode_len]
+        barcode_key = barcode_lookup.get(barcode, None)
 
-        if has_source and has_barcode:
-            count_vals[source_idx, barcode_idx] += 1
+        if barcode is None:
+            no_barcode += 1
+            if split_writer is not None:
+                split_writer.write(read, barcode=barcode.decode())
+            continue
 
-        if split_writer is not None:
-            split_writer.write(read, barcode=barcode,
-                               source=source)
+        oligo_idx = loop_idx + oligo_offset
+        oligo = read_str[oligo_idx:oligo_idx+oligo_len]
+        oligo_key = library_lookup.get(oligo, None)
+
+        if oligo_key is None:
+            oligo_counts[oligo] += 1
+            no_oligo += 1
+            if split_writer is not None:
+                split_writer.write(read, barcode="unknown_oligo")
+            continue
+
+        count_vals[oligo_key, barcode_key] += 1
 
     stats = {
         'num_reads': num_reads,
-        'count_no_barcode': count_no_barcode,
-        'count_not_in_lib': count_no_source,
-        'count_contains_N': count_contains_N,
+        'no_loop': no_loop,
+        'loop__no_adapter': no_adapter,
+        'loop__adapter__no_barcode': no_barcode,
+        'loop__adapter__barcode__no_oligo': no_oligo,
+        'bad_loop_idx': bad_loop_idx,
+        'loop_pos_dist': pos_dist,
+        'adapter_counts': adapter_counts,
     }
 
-    return counts, stats
+    return counts, stats, oligo_counts
+
+
+def lines(name):
+    if name == '-':
+        yield from sys.stdin.buffer
+    if name.endswith('.gz'):
+        with gzip.open(name, 'rb') as file:
+            yield from file
+    with open(name, 'rb') as file:
+        yield from file
+
+
+def read_fastq(filename, slice=None):
+    res = toolz.partition(4, lines(filename))
+    if slice is not None:
+        return itertools.islice(res, slice)
+    return res
 
 
 def main():
