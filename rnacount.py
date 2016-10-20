@@ -197,7 +197,7 @@ def count_reads(reads, library, barcodes, loop_rc, adapters,
         barcode = read_str[barcode_idx:barcode_idx+barcode_len]
         barcode_key = barcode_lookup.get(barcode, None)
 
-        if barcode is None:
+        if barcode_key is None:
             no_barcode += 1
             if split_writer is not None:
                 split_writer.write(read, barcode=barcode.decode())
